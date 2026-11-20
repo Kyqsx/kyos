@@ -1,4 +1,4 @@
-use crate::memory::{fisico_para_virtual, offset_fisico, zerar_frame, FramesGlobais};
+use crate::memory::{fisico_para_virtual, liberar_frame, offset_fisico, zerar_frame, FramesGlobais};
 use alloc::vec::Vec;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::mapper::TranslateResult;
@@ -77,7 +77,10 @@ impl Usuario {
             };
             match mapeou {
                 Ok(flush) => flush.flush(),
-                Err(_) => break,
+                Err(_) => {
+                    liberar_frame(frame);
+                    break;
+                }
             }
             self.heap_fim += TAMANHO_PAGINA;
         }
@@ -89,6 +92,16 @@ impl Usuario {
     /// "valido" mas nao mapeado causaria page fault DENTRO do kernel.
     /// Deve ser chamada enquanto a tabela de paginas do processo esta ativa.
     pub fn regiao_valida(&self, ptr: u64, len: u64) -> bool {
+        self.regiao_ok(ptr, len, false)
+    }
+
+    /// Igual a `regiao_valida`, mas as paginas tambem precisam ser gravaveis:
+    /// o kernel so escreve em memoria do usuario que o proprio usuario poderia escrever.
+    pub fn regiao_gravavel(&self, ptr: u64, len: u64) -> bool {
+        self.regiao_ok(ptr, len, true)
+    }
+
+    fn regiao_ok(&self, ptr: u64, len: u64, exigir_escrita: bool) -> bool {
         if len == 0 {
             return true;
         }
@@ -104,13 +117,53 @@ impl Usuario {
         while pagina < fim {
             match mapper.translate(VirtAddr::new(pagina)) {
                 TranslateResult::Mapped { flags, .. }
-                    if flags.contains(PageTableFlags::USER_ACCESSIBLE) => {}
+                    if flags.contains(PageTableFlags::USER_ACCESSIBLE)
+                        && (!exigir_escrita || flags.contains(PageTableFlags::WRITABLE)) => {}
                 _ => return false,
             }
             pagina += TAMANHO_PAGINA;
         }
         true
     }
+}
+
+/// Devolve ao sistema TUDO que pertence a um processo: paginas de dados, tabelas
+/// intermediarias e o proprio PML4. Dono = toda entrada do PML4 do processo que a tabela
+/// do kernel nao tem (as demais sao copias das do kernel e nunca podem ser liberadas).
+///
+/// Seguranca: `cr3` nao pode ser a tabela ativa, e o processo nao pode mais rodar.
+pub fn liberar_espaco(cr3: u64) {
+    unsafe {
+        let pml4: &mut PageTable =
+            &mut *fisico_para_virtual(PhysAddr::new(cr3)).as_mut_ptr::<PageTable>();
+        let kernel: &PageTable =
+            &*fisico_para_virtual(PhysAddr::new(crate::escalonador::cr3_kernel()))
+                .as_ptr::<PageTable>();
+        for i in 0..512 {
+            let e = &mut pml4[i];
+            if e.flags().contains(PageTableFlags::PRESENT) && kernel[i].is_unused() {
+                liberar_tabela(e.addr(), 3);
+                e.set_unused();
+            }
+        }
+    }
+    liberar_frame(PhysFrame::containing_address(PhysAddr::new(cr3)));
+}
+
+/// Libera uma tabela de paginas de nivel `nivel` (3 = PDPT, 2 = PD, 1 = PT) e tudo abaixo dela.
+unsafe fn liberar_tabela(addr: PhysAddr, nivel: u8) {
+    let tabela: &PageTable = &*fisico_para_virtual(addr).as_ptr::<PageTable>();
+    for e in tabela.iter() {
+        if !e.flags().contains(PageTableFlags::PRESENT) {
+            continue;
+        }
+        if nivel == 1 {
+            liberar_frame(PhysFrame::containing_address(e.addr()));
+        } else if !e.flags().contains(PageTableFlags::HUGE_PAGE) {
+            liberar_tabela(e.addr(), nivel - 1);
+        }
+    }
+    liberar_frame(PhysFrame::containing_address(addr));
 }
 
 unsafe fn mapper_atual() -> OffsetPageTable<'static> {
@@ -253,10 +306,28 @@ pub fn carregar_elf(
     }
 
     // ---------- 2. Espaco de enderecos novo ----------
+    // Se qualquer etapa falhar, tudo que ja foi entregue ao processo volta para o sistema.
+    let pml4_frame = frames.allocate_frame().ok_or("sem memoria")?;
+    let resultado = montar(frames, elf, &segmentos, dinamico, entrada, pml4_frame);
+    if resultado.is_err() {
+        liberar_espaco(pml4_frame.start_address().as_u64());
+    }
+    resultado
+}
+
+/// Etapas 2 a 5 do carregamento: monta as tabelas, copia os segmentos, aplica as
+/// relocacoes e cria a pilha, tudo dentro do PML4 `pml4_frame` (que o chamador libera se der erro).
+fn montar(
+    frames: &mut impl FrameAllocator<Size4KiB>,
+    elf: &[u8],
+    segmentos: &[Segmento],
+    dinamico: Option<(u64, u64)>,
+    entrada: u64,
+    pml4_frame: PhysFrame,
+) -> Result<Usuario, &'static str> {
     // Copia as entradas do kernel (sem a flag USER, entao o ring 3 nao toca em nada delas).
     // A copia vem SEMPRE da tabela do kernel, nunca da do processo que pediu o carregamento
     // (um shell, por exemplo): senao o programa novo herdaria a memoria dele.
-    let pml4_frame = frames.allocate_frame().ok_or("sem memoria")?;
     let novo: &'static mut PageTable =
         unsafe { &mut *fisico_para_virtual(pml4_frame.start_address()).as_mut_ptr::<PageTable>() };
     let atual: &PageTable = unsafe {
@@ -284,7 +355,7 @@ pub fn carregar_elf(
 
     // ---------- 3. Mapeia cada segmento com as permissoes dele ----------
     let mut paginas: Vec<(u64, PhysFrame)> = Vec::new(); // (endereco dentro da imagem, frame)
-    for s in &segmentos {
+    for s in segmentos.iter() {
         let mut flags_pagina = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
         if s.flags & PF_W != 0 {
             flags_pagina |= PageTableFlags::WRITABLE;
@@ -314,16 +385,20 @@ pub fn carregar_elf(
                     core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
                 }
 
-                mapper
-                    .map_to_with_table_flags(
-                        Page::<Size4KiB>::containing_address(VirtAddr::new(base + pagina_off)),
-                        frame,
-                        flags_pagina,
-                        flags_pai,
-                        &mut *frames,
-                    )
-                    .map_err(|_| "falha ao mapear segmento (segmentos sobrepostos?)")?
-                    .ignore();
+                match mapper.map_to_with_table_flags(
+                    Page::<Size4KiB>::containing_address(VirtAddr::new(base + pagina_off)),
+                    frame,
+                    flags_pagina,
+                    flags_pai,
+                    &mut *frames,
+                ) {
+                    Ok(flush) => flush.ignore(),
+                    Err(_) => {
+                        // Este frame ainda nao esta em tabela nenhuma: libera aqui.
+                        liberar_frame(frame);
+                        return Err("falha ao mapear segmento (segmentos sobrepostos?)");
+                    }
+                }
             }
             paginas.push((pagina_off, frame));
             pagina_off += TAMANHO_PAGINA;
@@ -407,21 +482,24 @@ pub fn carregar_elf(
         let frame = frames.allocate_frame().ok_or("sem memoria")?;
         unsafe {
             zerar_frame(frame);
-            mapper
-                .map_to_with_table_flags(
-                    Page::<Size4KiB>::containing_address(VirtAddr::new(
-                        pilha_inicio + i * TAMANHO_PAGINA,
-                    )),
-                    frame,
-                    PageTableFlags::PRESENT
-                        | PageTableFlags::WRITABLE
-                        | PageTableFlags::USER_ACCESSIBLE
-                        | PageTableFlags::NO_EXECUTE,
-                    flags_pai,
-                    &mut *frames,
-                )
-                .map_err(|_| "falha ao mapear a pilha")?
-                .ignore();
+            match mapper.map_to_with_table_flags(
+                Page::<Size4KiB>::containing_address(VirtAddr::new(
+                    pilha_inicio + i * TAMANHO_PAGINA,
+                )),
+                frame,
+                PageTableFlags::PRESENT
+                    | PageTableFlags::WRITABLE
+                    | PageTableFlags::USER_ACCESSIBLE
+                    | PageTableFlags::NO_EXECUTE,
+                flags_pai,
+                &mut *frames,
+            ) {
+                Ok(flush) => flush.ignore(),
+                Err(_) => {
+                    liberar_frame(frame);
+                    return Err("falha ao mapear a pilha");
+                }
+            }
         }
     }
 

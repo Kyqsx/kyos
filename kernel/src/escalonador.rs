@@ -1,5 +1,5 @@
 use crate::processo::Usuario;
-use alloc::{boxed::Box, vec, vec::Vec};
+use alloc::{boxed::Box, string::String, vec, vec::Vec};
 use spin::Mutex;
 use x86_64::instructions::interrupts::without_interrupts;
 use x86_64::registers::control::Cr3;
@@ -55,7 +55,7 @@ enum Estado {
 
 struct Tarefa {
     id: usize,
-    nome: &'static str,
+    nome: String,
     /// Topo da pilha da tarefa enquanto ela nao esta rodando.
     rsp: u64,
     /// So guardamos para a memoria nao ser liberada enquanto a tarefa existe.
@@ -65,6 +65,8 @@ struct Tarefa {
     /// Tabela de paginas (endereco fisico) usada enquanto a tarefa roda.
     cr3: u64,
     usuario: Option<Usuario>,
+    /// A memoria do processo (tabelas, pilha, heap, imagem) ja voltou para o sistema?
+    colhida: bool,
     estado: Estado,
 }
 
@@ -91,19 +93,22 @@ pub fn iniciar() {
         e.cr3_kernel = cr3;
         e.tarefas.push(Box::new(Tarefa {
             id: 0,
-            nome: "kernel",
+            nome: String::from("kernel"),
             rsp: 0,
             _pilha: Vec::new().into_boxed_slice(),
             pilha_topo: 0,
             cr3,
             usuario: None,
+            colhida: false,
             estado: Estado::Rodando,
         }));
         e.atual = 0;
     });
 }
 
-fn criar_com(nome: &'static str, entrada: extern "C" fn(), usuario: Option<Usuario>) -> usize {
+fn criar_com(nome: &str, entrada: extern "C" fn(), usuario: Option<Usuario>) -> usize {
+    // Devolve ao sistema a memoria de processos que ja terminaram.
+    without_interrupts(colher);
     let mut pilha: Box<[u8]> = vec![0u8; TAMANHO_PILHA].into_boxed_slice();
     let topo = (pilha.as_mut_ptr() as usize + TAMANHO_PILHA) & !0xF;
 
@@ -129,12 +134,13 @@ fn criar_com(nome: &'static str, entrada: extern "C" fn(), usuario: Option<Usuar
         };
         let nova = Box::new(Tarefa {
             id,
-            nome,
+            nome: String::from(nome),
             rsp: rsp as u64,
             _pilha: pilha,
             pilha_topo: topo as u64,
             cr3,
             usuario,
+            colhida: false,
             estado: Estado::Pronta,
         });
         // Reaproveita o lugar de uma tarefa ja terminada (e que nao e a que esta rodando):
@@ -144,7 +150,11 @@ fn criar_com(nome: &'static str, entrada: extern "C" fn(), usuario: Option<Usuar
             .tarefas
             .iter()
             .enumerate()
-            .position(|(i, t)| t.estado == Estado::Terminada && i != atual);
+            .position(|(i, t)| {
+                t.estado == Estado::Terminada
+                    && i != atual
+                    && (t.usuario.is_none() || t.colhida)
+            });
         match livre {
             Some(i) => e.tarefas[i] = nova,
             None => e.tarefas.push(nova),
@@ -161,7 +171,7 @@ pub fn criar(nome: &'static str, entrada: extern "C" fn()) {
 
 /// Cria um processo de usuario (tarefa com espaco de enderecos proprio).
 /// Devolve o identificador da tarefa.
-pub fn criar_usuario(nome: &'static str, usuario: Usuario) -> usize {
+pub fn criar_usuario(nome: &str, usuario: Usuario) -> usize {
     criar_com(nome, entrada_usuario, Some(usuario))
 }
 
@@ -268,7 +278,39 @@ pub fn trocar() {
         crate::syscall::definir_pilha(topo);
     }
 
+    // Ja estamos na tabela de paginas da proxima tarefa, entao a de um processo
+    // que acabou de terminar pode ser desmontada.
+    colher();
+
     unsafe { trocar_contexto(salvar, novo) };
+}
+
+/// Devolve ao sistema a memoria dos processos terminados (um por vez, sem segurar o lock
+/// durante a liberacao). Nunca mexe na tabela de paginas que esta ativa agora.
+/// Deve ser chamada com as interrupcoes desligadas.
+fn colher() {
+    loop {
+        let alvo = {
+            let mut e = ESCALONADOR.lock();
+            let ativa = Cr3::read().0.start_address().as_u64();
+            e.tarefas
+                .iter_mut()
+                .find(|t| {
+                    t.estado == Estado::Terminada
+                        && !t.colhida
+                        && t.usuario.is_some()
+                        && t.cr3 != ativa
+                })
+                .map(|t| {
+                    t.colhida = true;
+                    t.cr3
+                })
+        };
+        match alvo {
+            Some(cr3) => crate::processo::liberar_espaco(cr3),
+            None => break,
+        }
+    }
 }
 
 /// Cede a CPU voluntariamente.

@@ -15,11 +15,14 @@ macro_rules! println {
 }
 
 mod allocator;
+mod arquivos;
 mod console;
+mod disco;
 mod escalonador;
 mod gdt;
 mod interrupts;
 mod memory;
+mod pci;
 mod processo;
 mod serial;
 mod syscall;
@@ -107,7 +110,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     escalonador::iniciar();
     syscall::iniciar();
 
-    println!("Programas embutidos:");
+    // ---- Disco e arquivos ----
+    match disco::iniciar() {
+        Ok(()) => {
+            let setores = disco::capacidade().unwrap_or(0);
+            println!("Disco virtio-blk: {} setores ({} KiB)", setores, setores / 2);
+            match arquivos::iniciar() {
+                Ok(n) => println!("Sistema de arquivos KYFS: {} arquivos", n),
+                Err(e) => println!("Sem sistema de arquivos: {}", e),
+            }
+        }
+        Err(e) => println!("Sem disco: {}", e),
+    }
+
+    println!("Programas embutidos (usados se o disco falhar):");
     for (nome, elf) in PROGRAMAS {
         println!("  {} ({} bytes)", nome, elf.len());
     }
@@ -121,10 +137,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     halt()
 }
 
-/// Carrega um dos programas embutidos e cria o processo. Devolve o id dele.
-/// Se o arquivo for rejeitado, mostra o motivo e devolve None.
+/// Carrega um programa e cria o processo. Devolve o id dele.
+/// Procura primeiro no disco; se nao houver (ou nao houver disco), usa os programas
+/// embutidos na imagem do kernel. Se o arquivo for rejeitado, mostra o motivo e devolve None.
 pub fn executar_programa(nome: &str) -> Option<usize> {
-    let &(nome, elf) = PROGRAMAS.iter().find(|(n, _)| *n == nome)?;
+    const MAXIMO: usize = 1024 * 1024;
+    let do_disco;
+    let elf: &[u8] = match arquivos::ler_tudo(nome, MAXIMO) {
+        Ok(dados) => {
+            println!("[kernel] '{}' carregado do disco ({} bytes)", nome, dados.len());
+            do_disco = dados;
+            &do_disco
+        }
+        Err(_) => PROGRAMAS.iter().find(|(n, _)| *n == nome)?.1,
+    };
     match processo::carregar_elf(&mut memory::FramesGlobais, elf) {
         Ok(usuario) => Some(escalonador::criar_usuario(nome, usuario)),
         Err(motivo) => {

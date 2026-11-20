@@ -6,8 +6,8 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use usuario::{
-    brk, esperar, executar, heap_bytes, ler_tecla, limpar_tela, listar_tarefas,
-    memoria_sistema_kib, print, println, sair, tempo_ms,
+    brk, esperar, executar, heap_bytes, info_arquivo, ler_arquivo, ler_tecla, limpar_tela,
+    listar_tarefas, memoria_sistema_kib, print, println, sair, tempo_ms,
 };
 
 const MAX_LINHA: usize = 200;
@@ -71,6 +71,9 @@ fn executar_linha(linha: &str, historico: &[String]) {
         "tarefas" => listar_tarefas(),
         "memoria" => memoria(),
         "alocar" => alocar(resto),
+        "estresse" => estresse(resto),
+        "ls" => listar_arquivos(),
+        "cat" => mostrar_arquivo(resto),
         "historico" => {
             for (i, h) in historico.iter().enumerate() {
                 println!("  {:2}  {}", i + 1, h);
@@ -95,10 +98,13 @@ fn ajuda() {
     println!("  tarefas          lista as tarefas do kernel");
     println!("  memoria          uso de memoria do sistema e deste shell");
     println!("  alocar <KiB>     aloca e usa memoria dinamica (testa o brk)");
+    println!("  estresse <n>     roda 'falha' n vezes e compara a memoria antes e depois");
+    println!("  ls               lista os arquivos do disco");
+    println!("  cat <arquivo>    mostra o conteudo de um arquivo");
     println!("  historico        ultimos comandos");
     println!("  limpar           limpa a tela");
     println!("  sair             encerra o shell");
-    println!("  <programa> [&]   roda um programa embutido: ola, falha");
+    println!("  <programa> [&]   roda um programa do disco (veja 'ls'): ola, falha...");
     println!("                   (com & o shell nao espera ele terminar)");
 }
 
@@ -151,4 +157,80 @@ fn rodar(texto: &str) {
         }
         None => println!("comando desconhecido: '{}' (digite 'ajuda')", nome),
     }
+}
+
+/// Abre e fecha varios processos e mostra se a memoria do sistema voltou ao que era.
+fn estresse(arg: &str) {
+    let n: u32 = match arg.parse() {
+        Ok(n) if (1..=200).contains(&n) => n,
+        _ => {
+            println!("uso: estresse <n>   (de 1 a 200)");
+            return;
+        }
+    };
+    let (antes, total) = memoria_sistema_kib();
+    for _ in 0..n {
+        match executar("falha") {
+            Some(id) => esperar(id),
+            None => {
+                println!("estresse: nao consegui criar o processo");
+                break;
+            }
+        }
+    }
+    // Da um instante para o kernel colher o ultimo processo.
+    usuario::dormir_ms(50);
+    let (depois, _) = memoria_sistema_kib();
+    println!(
+        "estresse: {} processos; memoria entregue antes {} KiB, depois {} KiB (total {} KiB)",
+        n, antes, depois, total
+    );
+}
+
+fn listar_arquivos() {
+    let mut n = 0;
+    while let Some(info) = info_arquivo(n) {
+        println!("  {:>8} bytes  {}", info.tamanho, info.nome());
+        n += 1;
+    }
+    if n == 0 {
+        println!("  (nenhum arquivo: o disco nao foi encontrado?)");
+    }
+}
+
+/// Mostra um arquivo em blocos. Bytes que nao sao texto aparecem como '.'.
+fn mostrar_arquivo(nome: &str) {
+    const LIMITE: u64 = 16 * 1024;
+    if nome.is_empty() {
+        println!("uso: cat <arquivo>");
+        return;
+    }
+    let mut bloco = [0u8; 512];
+    let mut posicao = 0u64;
+    loop {
+        let n = match ler_arquivo(nome, posicao, &mut bloco) {
+            Some(n) => n,
+            None => {
+                println!("cat: arquivo '{}' nao encontrado", nome);
+                return;
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        let mut texto = String::new();
+        for &b in &bloco[..n] {
+            match b {
+                b'\n' | 0x20..=0x7e => texto.push(b as char),
+                _ => texto.push('.'),
+            }
+        }
+        print!("{}", texto);
+        posicao += n as u64;
+        if posicao >= LIMITE {
+            println!("\n[... cortado em {} bytes]", LIMITE);
+            return;
+        }
+    }
+    println!();
 }

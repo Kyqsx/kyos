@@ -20,6 +20,8 @@ pub const SYS_ESPERAR: u64 = 8;
 pub const SYS_TAREFAS: u64 = 9;
 pub const SYS_MEMINFO: u64 = 10;
 pub const SYS_LIMPAR: u64 = 11;
+pub const SYS_INFO_ARQUIVO: u64 = 12;
+pub const SYS_LER_ARQUIVO: u64 = 13;
 /// Valor devolvido pelo kernel quando uma syscall falha.
 pub const ERRO: u64 = u64::MAX;
 
@@ -110,6 +112,45 @@ pub fn memoria_sistema_kib() -> (u64, u64) {
 
 pub fn limpar_tela() {
     syscall(SYS_LIMPAR, 0, 0, 0);
+}
+
+/// Informacoes de um arquivo do disco (mesmo formato que o kernel preenche).
+#[repr(C)]
+pub struct InfoArquivo {
+    pub tamanho: u64,
+    nome: [u8; 40],
+}
+
+impl InfoArquivo {
+    pub fn nome(&self) -> &str {
+        let fim = self.nome.iter().position(|&b| b == 0).unwrap_or(self.nome.len());
+        core::str::from_utf8(&self.nome[..fim]).unwrap_or("?")
+    }
+}
+
+/// Informacoes do arquivo de numero `indice` (None quando os arquivos acabam).
+pub fn info_arquivo(indice: u64) -> Option<InfoArquivo> {
+    let mut info = InfoArquivo { tamanho: 0, nome: [0; 40] };
+    match syscall(SYS_INFO_ARQUIVO, indice, &mut info as *mut InfoArquivo as u64, 0) {
+        ERRO => None,
+        _ => Some(info),
+    }
+}
+
+/// Le ate `buf.len()` bytes (no maximo 4096) de um arquivo do disco, a partir de `deslocamento`.
+/// Devolve quantos bytes vieram (0 = fim do arquivo) ou None se o arquivo nao existe.
+pub fn ler_arquivo(nome: &str, deslocamento: u64, buf: &mut [u8]) -> Option<usize> {
+    let pedido: [u64; 5] = [
+        nome.as_ptr() as u64,
+        nome.len() as u64,
+        deslocamento,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    ];
+    match syscall(SYS_LER_ARQUIVO, pedido.as_ptr() as u64, 0, 0) {
+        ERRO => None,
+        n => Some(n as usize),
+    }
 }
 
 // ---- Alocador de memoria do programa ----

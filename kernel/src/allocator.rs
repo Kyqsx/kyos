@@ -6,7 +6,7 @@ use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, S
 use x86_64::VirtAddr;
 
 pub const HEAP_START: usize = 0x_4444_4444_0000;
-pub const HEAP_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
+pub const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
 
 /// Envolve o alocador e desliga as interrupcoes durante cada operacao.
 /// Sem isso, uma tarefa preemptada no meio de uma alocacao seguraria o lock

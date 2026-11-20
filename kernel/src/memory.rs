@@ -44,44 +44,155 @@ pub unsafe fn init(offset: VirtAddr) -> OffsetPageTable<'static> {
     OffsetPageTable::new(tabela, offset)
 }
 
-/// Entrega frames fisicos livres, na ordem do mapa de memoria do bootloader.
+/// Frames abaixo de 1 MiB (BIOS, firmware, area legada) nunca sao entregues.
+const LIMITE_BAIXO: u64 = 0x10_0000;
+
+/// Alocador de frames com liberacao: um bit por frame (1 = em uso).
+/// O mapa de bits mora num trecho de memoria utilizavel escolhido na inicializacao.
 pub struct BootInfoFrameAllocator {
-    regioes: &'static MemoryRegions,
-    proximo: usize,
+    bitmap: &'static mut [u64],
+    /// Quantos frames o mapa de bits cobre (do endereco 0 ate o fim da ultima regiao utilizavel).
+    cobertos: usize,
+    /// Frames utilizaveis no total (fora o do proprio mapa de bits) e quantos estao em uso.
+    utilizaveis: usize,
+    usados: usize,
+    /// Palavra do mapa de bits onde a proxima busca comeca.
+    dica: usize,
 }
 
 impl BootInfoFrameAllocator {
-    /// Seguranca: o mapa de memoria precisa ser o real, e as regioes
-    /// marcadas como `Usable` precisam estar mesmo livres.
+    /// Seguranca: o mapa de memoria precisa ser o real, as regioes marcadas como `Usable`
+    /// precisam estar mesmo livres e `memory::init` ja precisa ter sido chamada
+    /// (toda a memoria fisica tem que estar acessivel pelo offset).
     pub unsafe fn init(regioes: &'static MemoryRegions) -> Self {
-        BootInfoFrameAllocator { regioes, proximo: 0 }
-    }
+        let utilizavel = |r: &&bootloader_api::info::MemoryRegion| {
+            r.kind == MemoryRegionKind::Usable
+        };
+        // Trecho utilizavel de cada regiao: alinhado a pagina e acima de 1 MiB.
+        let trecho = |r: &bootloader_api::info::MemoryRegion| -> (u64, u64) {
+            let ini = (r.start.max(LIMITE_BAIXO) + 0xfff) & !0xfff;
+            let fim = r.end & !0xfff;
+            (ini, fim.max(ini))
+        };
 
-    /// Quantos frames ja foram entregues.
-    pub fn usados(&self) -> usize {
-        self.proximo
-    }
-
-    /// Quantos frames utilizaveis existem no total.
-    pub fn total(&self) -> usize {
-        self.frames_livres().count()
-    }
-
-    fn frames_livres(&self) -> impl Iterator<Item = PhysFrame> {
-        self.regioes
+        let fim_maximo = regioes
             .iter()
-            .filter(|r| r.kind == MemoryRegionKind::Usable)
-            .map(|r| r.start..r.end)
-            .flat_map(|faixa| faixa.step_by(4096))
-            .map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
+            .filter(utilizavel)
+            .map(|r| trecho(r).1)
+            .max()
+            .unwrap_or(0);
+        let cobertos = (fim_maximo / 4096) as usize;
+        let palavras = (cobertos + 63) / 64;
+        let paginas_bitmap = ((palavras * 8) + 4095) / 4096;
+
+        // Onde guardar o mapa de bits: o primeiro trecho utilizavel grande o bastante.
+        let inicio_bitmap = regioes
+            .iter()
+            .filter(utilizavel)
+            .map(|r| trecho(r))
+            .find(|(i, f)| ((f - i) / 4096) as usize >= paginas_bitmap)
+            .map(|(i, _)| i)
+            .expect("nenhuma regiao de memoria grande o bastante para o mapa de bits");
+
+        let bitmap: &'static mut [u64] = core::slice::from_raw_parts_mut(
+            fisico_para_virtual(PhysAddr::new(inicio_bitmap)).as_mut_ptr::<u64>(),
+            palavras,
+        );
+        bitmap.fill(u64::MAX); // tudo "em uso" ate prova em contrario
+
+        let mut a = BootInfoFrameAllocator {
+            bitmap,
+            cobertos,
+            utilizaveis: 0,
+            usados: 0,
+            dica: 0,
+        };
+        for r in regioes.iter().filter(utilizavel) {
+            let (ini, fim) = trecho(r);
+            let mut addr = ini;
+            while addr < fim {
+                a.marcar((addr / 4096) as usize, false);
+                a.utilizaveis += 1;
+                addr += 4096;
+            }
+        }
+        // O mapa de bits nao pode ser entregue a ninguem.
+        for k in 0..paginas_bitmap {
+            a.marcar((inicio_bitmap / 4096) as usize + k, true);
+            a.utilizaveis -= 1;
+        }
+        a
+    }
+
+    fn marcar(&mut self, idx: usize, usado: bool) {
+        let (palavra, bit) = (idx / 64, idx % 64);
+        if usado {
+            self.bitmap[palavra] |= 1 << bit;
+        } else {
+            self.bitmap[palavra] &= !(1 << bit);
+        }
+    }
+
+    /// Frames utilizaveis que estao em uso agora.
+    pub fn usados(&self) -> usize {
+        self.usados
+    }
+
+    /// Frames utilizaveis no total.
+    pub fn total(&self) -> usize {
+        self.utilizaveis
+    }
+
+    /// Entrega `n` frames fisicamente consecutivos (para DMA). Devolve o primeiro.
+    pub fn alocar_contiguos(&mut self, n: usize) -> Option<PhysFrame> {
+        let mut corrida = 0usize;
+        for idx in 0..self.cobertos {
+            if self.bitmap[idx / 64] & (1 << (idx % 64)) == 0 {
+                corrida += 1;
+                if corrida == n {
+                    let ini = idx + 1 - n;
+                    for k in ini..=idx {
+                        self.marcar(k, true);
+                    }
+                    self.usados += n;
+                    return Some(PhysFrame::containing_address(PhysAddr::new(ini as u64 * 4096)));
+                }
+            } else {
+                corrida = 0;
+            }
+        }
+        None
+    }
+
+    /// Devolve um frame. Liberar duas vezes (ou um frame que nunca foi entregue)
+    /// e um bug grave no kernel, entao para tudo em vez de corromper a memoria.
+    pub fn liberar(&mut self, frame: PhysFrame) {
+        let idx = (frame.start_address().as_u64() / 4096) as usize;
+        if idx >= self.cobertos || self.bitmap[idx / 64] & (1 << (idx % 64)) == 0 {
+            panic!("frame liberado em duplicidade ou invalido: {:#x}", frame.start_address());
+        }
+        self.marcar(idx, false);
+        self.usados -= 1;
+        self.dica = self.dica.min(idx / 64);
     }
 }
 
 unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
-        let frame = self.frames_livres().nth(self.proximo);
-        self.proximo += 1;
-        frame
+        let n = self.bitmap.len();
+        for passo in 0..n {
+            let i = (self.dica + passo) % n;
+            let palavra = self.bitmap[i];
+            if palavra != u64::MAX {
+                let bit = (!palavra).trailing_zeros() as usize;
+                self.bitmap[i] |= 1 << bit;
+                self.usados += 1;
+                self.dica = i;
+                let addr = ((i * 64 + bit) * 4096) as u64;
+                return Some(PhysFrame::containing_address(PhysAddr::new(addr)));
+            }
+        }
+        None
     }
 }
 
@@ -106,6 +217,22 @@ unsafe impl FrameAllocator<Size4KiB> for FramesGlobais {
             None => None,
         })
     }
+}
+
+/// Pede `n` frames consecutivos ao alocador global (usado pelos drivers, para DMA).
+pub fn alocar_contiguos(n: usize) -> Option<PhysFrame> {
+    without_interrupts(|| match FRAMES.lock().as_mut() {
+        Some(a) => a.alocar_contiguos(n),
+        None => None,
+    })
+}
+
+/// Devolve um frame ao sistema. Quem chama nao pode mais usar a memoria dele.
+pub fn liberar_frame(frame: PhysFrame) {
+    without_interrupts(|| match FRAMES.lock().as_mut() {
+        Some(a) => a.liberar(frame),
+        None => panic!("alocador de frames nao iniciado"),
+    });
 }
 
 /// Memoria fisica em KiB: `0` = ja entregue (kernel + processos), `1` = total utilizavel.
