@@ -14,6 +14,10 @@ fn main() {
         .arg("virtio-blk-pci,drive=disco,disable-modern=on");
     cmd.arg("-serial").arg("stdio");
 
+    // Argumentos extras vao direto para o QEMU (ex.: `cargo run -- -display none`).
+    // O teste automatizado (tests/qemu_teste.py) usa isso.
+    cmd.args(std::env::args().skip(1));
+
     let status = cmd.status().expect("nao consegui abrir o QEMU (esta no PATH?)");
     exit(status.code().unwrap_or(1));
 }
