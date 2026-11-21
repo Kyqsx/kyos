@@ -6,6 +6,9 @@
 //!                    nome[40] (ASCII, terminado em 0), u64 setor inicial, u64 tamanho em bytes
 //!   setor 9 em diante: dados dos arquivos, cada um comecando em um setor.
 //! O disco e montado pelo build.rs do projeto raiz.
+//!
+//! Este modulo so serve ao carregador de programas do kernel (`executar_programa`).
+//! Os processos de usuario acessam arquivos pelo servidor de arquivos (programa `fs`).
 
 use crate::disco::{self, TAMANHO_SETOR};
 use alloc::string::String;
@@ -74,13 +77,6 @@ pub fn iniciar() -> Result<usize, &'static str> {
     let n = lista.len();
     without_interrupts(|| *ARQUIVOS.lock() = lista);
     Ok(n)
-}
-
-/// (nome, tamanho) do arquivo de numero `indice`.
-pub fn info(indice: usize) -> Option<(String, u64)> {
-    without_interrupts(|| {
-        ARQUIVOS.lock().get(indice).map(|e| (e.nome.clone(), e.tamanho))
-    })
 }
 
 fn procurar(nome: &str) -> Option<Entrada> {

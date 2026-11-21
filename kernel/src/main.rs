@@ -16,6 +16,7 @@ macro_rules! println {
 
 mod allocator;
 mod arquivos;
+mod capacidades;
 mod console;
 mod disco;
 mod escalonador;
@@ -42,9 +43,11 @@ use x86_64::VirtAddr;
 static OLA: &[u8] = include_bytes!(env!("PROGRAMA_OLA"));
 static FALHA: &[u8] = include_bytes!(env!("PROGRAMA_FALHA"));
 static SHELL: &[u8] = include_bytes!(env!("PROGRAMA_SHELL"));
+static IPC: &[u8] = include_bytes!(env!("PROGRAMA_IPC"));
+static FS: &[u8] = include_bytes!(env!("PROGRAMA_FS"));
 
 /// Nome -> programa. Sao os nomes que o shell aceita como comando.
-const PROGRAMAS: &[(&str, &[u8])] = &[("shell", SHELL), ("ola", OLA), ("falha", FALHA)];
+const PROGRAMAS: &[(&str, &[u8])] = &[("shell", SHELL), ("ola", OLA), ("falha", FALHA), ("ipc", IPC), ("fs", FS)];
 
 /// Pede ao bootloader que mapeie toda a memoria fisica em algum endereco virtual.
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
@@ -127,14 +130,41 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     for (nome, elf) in PROGRAMAS {
         println!("  {} ({} bytes)", nome, elf.len());
     }
-    if executar_programa("shell").is_none() {
-        panic!("nao consegui iniciar o shell");
-    }
+    iniciar_servicos();
 
     interrupts::habilitar();
 
     // A tarefa 0 (esta aqui) vira a tarefa ociosa: dorme ate a proxima interrupcao.
     halt()
+}
+
+/// Sobe o servidor de arquivos (ring 3) e o shell, e distribui as capacidades iniciais:
+///   - servidor de arquivos: o DISCO (somente leitura, handle 0) e o lado de RECEBER do
+///     canal de pedidos (handle 1);
+///   - shell: so o lado de ENVIAR do canal (handle 0). Pode repassa-lo a programas que ele
+///     lanca (`executar_com`), mas so o lado de ENVIAR: ninguem alem do servidor recebe.
+/// O shell nao tem capacidade do disco: para ler um arquivo ele precisa pedir ao servidor.
+fn iniciar_servicos() {
+    use capacidades::{Capacidade, DIREITO_COPIAR, DIREITO_ENVIAR, DIREITO_LER, DIREITO_RECEBER};
+
+    let canal = Capacidade::novo_endpoint();
+    let disco = Capacidade::novo_disco();
+    match executar_programa("fs") {
+        Some(id) => {
+            let so_ler = disco.derivar(DIREITO_LER).expect("capacidade do disco");
+            let receber = canal.derivar(DIREITO_RECEBER).expect("capacidade do canal");
+            assert!(escalonador::dar_capacidade(id, so_ler));
+            assert!(escalonador::dar_capacidade(id, receber));
+        }
+        None => println!("[kernel] sem servidor de arquivos: ls e cat nao vao funcionar"),
+    }
+    let shell = match executar_programa("shell") {
+        Some(id) => id,
+        None => panic!("nao consegui iniciar o shell"),
+    };
+    let enviar = canal.derivar(DIREITO_ENVIAR | DIREITO_COPIAR).expect("capacidade do canal");
+    assert!(escalonador::dar_capacidade(shell, enviar));
+    // `canal` e `disco` (todos os direitos) morrem aqui: o kernel nao fica com nenhum acesso.
 }
 
 /// Carrega um programa e cria o processo. Devolve o id dele.

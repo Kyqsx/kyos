@@ -1,3 +1,4 @@
+use crate::capacidades::{Capacidade, Tabela};
 use crate::processo::Usuario;
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
 use spin::Mutex;
@@ -65,6 +66,8 @@ struct Tarefa {
     /// Tabela de paginas (endereco fisico) usada enquanto a tarefa roda.
     cr3: u64,
     usuario: Option<Usuario>,
+    /// Capacidades do processo (endpoints de IPC). Morrem junto com ele.
+    caps: Tabela,
     /// A memoria do processo (tabelas, pilha, heap, imagem) ja voltou para o sistema?
     colhida: bool,
     estado: Estado,
@@ -99,6 +102,7 @@ pub fn iniciar() {
             pilha_topo: 0,
             cr3,
             usuario: None,
+            caps: Tabela::nova(),
             colhida: false,
             estado: Estado::Rodando,
         }));
@@ -140,6 +144,7 @@ fn criar_com(nome: &str, entrada: extern "C" fn(), usuario: Option<Usuario>) -> 
             pilha_topo: topo as u64,
             cr3,
             usuario,
+            caps: Tabela::nova(),
             colhida: false,
             estado: Estado::Pronta,
         });
@@ -214,6 +219,27 @@ pub fn atualizar_heap_fim(fim: u64) {
 extern "C" fn entrada_usuario() {
     let u = usuario_atual().expect("tarefa sem contexto de usuario");
     unsafe { crate::syscall::ir_para_usuario(u.rip, u.rsp) }
+}
+
+/// Da acesso a tabela de capacidades da tarefa que esta rodando.
+/// `f` roda com a trava do escalonador e com as interrupcoes desligadas: curto e sem esperar.
+pub fn com_caps_atual<R>(f: impl FnOnce(&mut Tabela) -> R) -> R {
+    without_interrupts(|| {
+        let mut e = ESCALONADOR.lock();
+        let i = e.atual;
+        f(&mut e.tarefas[i].caps)
+    })
+}
+
+/// Coloca uma capacidade na tabela da tarefa `id` (usado ao criar um processo filho).
+pub fn dar_capacidade(id: usize, cap: Capacidade) -> bool {
+    without_interrupts(|| {
+        let mut e = ESCALONADOR.lock();
+        match e.tarefas.iter_mut().find(|t| t.id == id) {
+            Some(t) => t.caps.inserir(cap).is_ok(),
+            None => false,
+        }
+    })
 }
 
 /// Contexto de usuario da tarefa que esta rodando (None se for tarefa do kernel).
@@ -332,9 +358,16 @@ pub fn dormir_ms(ms: u64) {
 /// Encerra a tarefa atual e nunca retorna.
 pub fn terminar_atual() -> ! {
     without_interrupts(|| {
-        let mut e = ESCALONADOR.lock();
-        let i = e.atual;
-        e.tarefas[i].estado = Estado::Terminada;
+        let caps = {
+            let mut e = ESCALONADOR.lock();
+            let i = e.atual;
+            e.tarefas[i].estado = Estado::Terminada;
+            // As capacidades morrem com o processo: quem esperava do outro lado de um
+            // endpoint passa a saber que o par se foi.
+            core::mem::replace(&mut e.tarefas[i].caps, Tabela::nova())
+        };
+        // Descartadas aqui, ja sem a trava do escalonador.
+        drop(caps);
     });
     loop {
         // A tarefa 0 sempre esta pronta, entao esta chamada nunca volta.

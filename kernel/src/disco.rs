@@ -179,7 +179,8 @@ pub fn ler(setor: u64, quantidade: usize, destino: &mut [u8]) -> Result<(), &'st
 
 impl Disco {
     fn ler_pedido(&mut self, setor: u64, n: usize, destino: &mut [u8]) -> Result<(), &'static str> {
-        if setor + n as u64 > self.capacidade {
+        // O numero do setor pode vir do usuario (syscall): nada de somar sem checar.
+        if setor.checked_add(n as u64).map_or(true, |fim| fim > self.capacidade) {
             return Err("leitura alem do fim do disco");
         }
         unsafe {

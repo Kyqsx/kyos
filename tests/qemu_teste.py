@@ -181,7 +181,7 @@ def t_boot(s):
     s.esperar(r"Heap ok: Box = 42, Vec soma = 124750", 10)
     s.esperar(r"Disco virtio-blk: \d+ setores", 10)
     m = s.esperar(r"Sistema de arquivos KYFS: (\d+) arquivos", 10)
-    afirmar(m.group(1) == "4", f"esperava 4 arquivos no KYFS, vieram {m.group(1)}")
+    afirmar(m.group(1) == "7", f"esperava 7 arquivos no KYFS, vieram {m.group(1)}")
     s.esperar(r"KyOS shell - digite 'ajuda'", 20)
     s.esperar(re.escape(PROMPT), 10)
 
@@ -198,7 +198,7 @@ def t_eco(s):
 
 def t_ls(s):
     saida = s.comando("ls")
-    for nome in ("shell", "ola", "falha", "leia-me.txt"):
+    for nome in ("shell", "ola", "falha", "ipc", "fs", "fsfuzz", "leia-me.txt"):
         afirmar(nome in saida, f"'{nome}' nao apareceu no ls: {saida!r}")
 
 
@@ -220,6 +220,39 @@ def t_desconhecido(s):
 def t_tarefas(s):
     saida = s.comando("tarefas")
     afirmar("shell" in saida, f"o shell nao aparece em 'tarefas': {saida!r}")
+
+
+def t_servidor_de_arquivos(s):
+    # ls e cat so funcionam se o servidor de arquivos (ring 3) estiver vivo e respondendo.
+    saida = s.comando("tarefas")
+    afirmar(re.search(r"\bfs\b", saida), f"o servidor 'fs' nao aparece em 'tarefas': {saida!r}")
+    # Varios pedidos seguidos: cada um cria e fecha uma capacidade de resposta; se alguma
+    # vazasse, a tabela de 16 capacidades do servidor encheria e os pedidos parariam.
+    for _ in range(25):
+        saida = s.comando("cat leia-me.txt")
+        afirmar("KyOS - arquivo lido do disco!" in saida,
+                f"cat deixou de funcionar apos varios pedidos: {saida!r}")
+
+
+def t_seguranca_do_fs(s):
+    saida = s.comando("fsfuzz", timeout=90)
+    afirmar("FALHA" not in saida, f"o fsfuzz relatou falha: {saida!r}")
+    esperado = [
+        "operacao desconhecida recusada (ok)",
+        "indices e tamanhos absurdos recusados (ok)",
+        "deslocamento e quantidade absurdos tratados (ok)",
+        "pedido sem capacidade de resposta ignorado (ok)",
+        "resposta sem direito de enviar ignorada (ok)",
+        "cliente que some antes da resposta nao trava o servidor (ok)",
+        "cliente que nunca le as respostas nao trava o servidor (ok)",
+        "o servidor continua respondendo normalmente (ok)",
+        "todos os testes de seguranca do servidor de arquivos passaram",
+    ]
+    for trecho in esperado:
+        afirmar(trecho in saida, f"faltou '{trecho}' na saida do fsfuzz: {saida!r}")
+    # E o shell ainda consegue usar o servidor depois dos ataques.
+    saida = s.comando("cat leia-me.txt")
+    afirmar("KyOS - arquivo lido do disco!" in saida, f"cat apos o fsfuzz: {saida!r}")
 
 
 def t_ola(s):
@@ -254,9 +287,38 @@ def t_estresse(s):
             f"VAZAMENTO: antes {m.group(1)} KiB, depois {m.group(2)} KiB")
 
 
+def t_ipc(s):
+    saida = s.comando("ipc", timeout=30)
+    afirmar("FALHA" not in saida, f"o programa 'ipc' relatou falha: {saida!r}")
+    esperado = [
+        "cliente: handle inexistente recusado (ok)",
+        "cliente: sem capacidade do disco, ler um setor foi recusado (ok)",
+        "servidor: uma capacidade de endpoint nao serve de disco (ok)",
+        "servidor: enviar sem o direito foi recusado (ok)",
+        "cliente: receber sem o direito foi recusado (ok)",
+        "servidor: nao consigo repassar a capacidade recebida (ok)",
+        "cliente: resposta do servidor = 42",
+        "cliente: servidor morto detectado ao enviar (ok)",
+        "cliente: servidor morto detectado ao receber (ok)",
+        "cliente: todos os testes de IPC passaram",
+    ]
+    for trecho in esperado:
+        afirmar(trecho in saida, f"faltou '{trecho}' na saida do ipc: {saida!r}")
+
+
+def t_estresse_ipc(s):
+    saida = s.comando("estresse 10 ipc", timeout=180)
+    m = re.search(r"memoria entregue antes (\d+) KiB, depois (\d+) KiB", saida)
+    afirmar(m, f"saida inesperada de 'estresse 10 ipc': {saida!r}")
+    afirmar(m.group(1) == m.group(2),
+            f"VAZAMENTO com IPC: antes {m.group(1)} KiB, depois {m.group(2)} KiB")
+
+
 def t_historico(s):
+    # O historico guarda so os 20 ultimos comandos; os testes anteriores ja empurraram os
+    # primeiros para fora. Conferimos os mais recentes.
     saida = s.comando("historico")
-    afirmar("eco kyos 123" in saida and "ls" in saida, f"historico: {saida!r}")
+    afirmar("estresse 10 ipc" in saida and "historico" in saida, f"historico: {saida!r}")
 
 
 def t_segundo_plano(s):
@@ -282,10 +344,14 @@ TESTES = [
     ("cat de arquivo inexistente", t_cat_inexistente),
     ("comando desconhecido", t_desconhecido),
     ("tarefas", t_tarefas),
+    ("servidor de arquivos em ring 3 (25 pedidos)", t_servidor_de_arquivos),
+    ("seguranca do servidor de arquivos (pedidos hostis)", t_seguranca_do_fs),
     ("ola (programa do disco, ring 3)", t_ola),
     ("falha (ponteiro ruim + hlt, shell sobrevive)", t_falha),
     ("alocar (brk em modo usuario)", t_alocar),
     ("estresse sem vazamento de frames", t_estresse),
+    ("ipc: capacidades, direitos e par morto", t_ipc),
+    ("estresse de IPC sem vazamento", t_estresse_ipc),
     ("historico", t_historico),
     ("programa em segundo plano (&)", t_segundo_plano),
     ("sair", t_sair),

@@ -20,6 +20,9 @@ fn main() {
         ("CARGO_BIN_FILE_USUARIO_shell", "shell"),
         ("CARGO_BIN_FILE_USUARIO_ola", "ola"),
         ("CARGO_BIN_FILE_USUARIO_falha", "falha"),
+        ("CARGO_BIN_FILE_USUARIO_ipc", "ipc"),
+        ("CARGO_BIN_FILE_USUARIO_fs", "fs"),
+        ("CARGO_BIN_FILE_USUARIO_fsfuzz", "fsfuzz"),
     ] {
         let caminho = std::env::var_os(variavel)
             .unwrap_or_else(|| panic!("programa '{nome}' nao foi compilado (artifact dependency)"));
@@ -29,8 +32,9 @@ fn main() {
         "leia-me.txt".to_string(),
         b"KyOS - arquivo lido do disco!\n\
           Este texto mora num disco virtio-blk, formatado com o KYFS,\n\
-          e chega ate aqui por: driver -> sistema de arquivos -> syscall -> shell.\n\
-          Tente: ls, cat leia-me.txt, ola, falha.\n"
+          e chega ate aqui por: driver (kernel) -> servidor de arquivos (ring 3) -> IPC -> shell.\n\
+          Tente: ls, cat leia-me.txt, ola, falha, ipc.\n\
+          (ls e cat agora passam pelo servidor de arquivos, o programa fs.)\n"
             .to_vec(),
     ));
 

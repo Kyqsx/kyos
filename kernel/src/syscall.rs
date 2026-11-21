@@ -1,3 +1,6 @@
+use crate::capacidades::{
+    Capacidade, ErroEnvio, ErroRecepcao, Mensagem, DIREITO_LER, PALAVRAS_DADOS,
+};
 use crate::{arquivos, console, escalonador, gdt, interrupts, memory, teclado};
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
@@ -14,9 +17,27 @@ pub const SYS_ESPERAR: u64 = 8; // (id) -> 0, quando o processo terminar
 pub const SYS_TAREFAS: u64 = 9; // () -> 0: lista as tarefas na tela
 pub const SYS_MEMINFO: u64 = 10; // (0 = KiB usados, 1 = KiB totais) -> KiB
 pub const SYS_LIMPAR: u64 = 11; // () -> 0: limpa a tela
-pub const SYS_INFO_ARQUIVO: u64 = 12; // (indice, ptr de InfoArquivo) -> 0, ou ERRO se acabaram
-pub const SYS_LER_ARQUIVO: u64 = 13; // (ptr de PedidoLeitura) -> bytes lidos (0 = fim)
+pub const SYS_EP_CRIAR: u64 = 14; // () -> handle de um endpoint novo (todos os direitos)
+pub const SYS_ENVIAR: u64 = 15; // (handle, ptr da mensagem) -> 0; espera se a fila estiver cheia
+pub const SYS_RECEBER: u64 = 16; // (handle, ptr da mensagem) -> 0; espera ate chegar uma
+pub const SYS_CAP_FECHAR: u64 = 17; // (handle) -> 0
+pub const SYS_CAP_REDUZIR: u64 = 18; // (handle, mascara de direitos) -> 0; so tira direitos
+pub const SYS_EXECUTAR_COM: u64 = 19; // (ptr, tamanho do nome, handle | mascara << 8) -> id
+pub const SYS_TENTAR_ENVIAR: u64 = 22; // como SYS_ENVIAR, mas devolve ERRO_CHEIA em vez de esperar
+pub const SYS_DISCO_LER: u64 = 20; // (handle | n_setores << 8, setor, ptr) -> 0
+pub const SYS_DISCO_INFO: u64 = 21; // (handle) -> tamanho do disco em setores
 const ERRO: u64 = u64::MAX;
+/// O outro lado do endpoint nao existe mais (todos os que podiam enviar/receber morreram).
+const ERRO_PAR_MORTO: u64 = u64::MAX - 1;
+/// A fila do endpoint esta cheia (so no envio sem bloqueio).
+const ERRO_CHEIA: u64 = u64::MAX - 2;
+/// "Nenhuma capacidade" no campo `cap` de uma mensagem.
+const SEM_CAP: u64 = u64::MAX;
+/// Mensagem na memoria do usuario: u64 seguidos
+/// (rotulo, cap, direitos da cap, flag "cap perdida", depois 32 palavras de dados).
+const CABECALHO_MENSAGEM: usize = 4;
+const PALAVRAS_MENSAGEM: usize = CABECALHO_MENSAGEM + PALAVRAS_DADOS;
+const TAM_MENSAGEM: u64 = (PALAVRAS_MENSAGEM * 8) as u64;
 
 // Variaveis de apoio da rotina de entrada (sistema de 1 nucleo: sem concorrencia aqui,
 // porque as interrupcoes ficam desligadas durante toda a syscall).
@@ -123,7 +144,7 @@ pub unsafe fn ir_para_usuario(rip: u64, rsp: u64) -> ! {
 }
 
 #[no_mangle]
-extern "C" fn syscall_despachar(num: u64, a1: u64, a2: u64, _a3: u64) -> u64 {
+extern "C" fn syscall_despachar(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     match num {
         SYS_ESCREVER => sys_escrever(a1, a2),
         SYS_SAIR => sys_sair(a1),
@@ -141,8 +162,15 @@ extern "C" fn syscall_despachar(num: u64, a1: u64, a2: u64, _a3: u64) -> u64 {
             0
         }
         SYS_MEMINFO => memory::info_kib(a1),
-        SYS_INFO_ARQUIVO => sys_info_arquivo(a1, a2),
-        SYS_LER_ARQUIVO => sys_ler_arquivo(a1),
+        SYS_EP_CRIAR => sys_ep_criar(),
+        SYS_ENVIAR => sys_enviar(a1, a2, true),
+        SYS_TENTAR_ENVIAR => sys_enviar(a1, a2, false),
+        SYS_RECEBER => sys_receber(a1, a2),
+        SYS_CAP_FECHAR => sys_cap_fechar(a1),
+        SYS_CAP_REDUZIR => sys_cap_reduzir(a1, a2),
+        SYS_EXECUTAR_COM => sys_executar_com(a1, a2, a3),
+        SYS_DISCO_LER => sys_disco_ler(a1, a2, a3),
+        SYS_DISCO_INFO => sys_disco_info(a1),
         SYS_LIMPAR => {
             console::limpar_tela();
             0
@@ -246,62 +274,235 @@ fn nome_do_usuario(
     core::str::from_utf8(bytes).ok().map(alloc::string::String::from)
 }
 
-/// Preenche (no usuario): tamanho: u64 e nome: [u8; 40], 48 bytes no total.
-fn sys_info_arquivo(indice: u64, ptr: u64) -> u64 {
-    let usuario = match escalonador::usuario_atual() {
-        Some(u) => u,
-        None => return ERRO,
-    };
-    if !usuario.regiao_gravavel(ptr, 48) {
-        return ERRO;
+// ---------------------------------------------------------------- IPC e capacidades
+
+/// Cria um endpoint e devolve o handle (com todos os direitos) na tabela do processo.
+fn sys_ep_criar() -> u64 {
+    match escalonador::com_caps_atual(|t| t.inserir(Capacidade::novo_endpoint())) {
+        Ok(h) => h as u64,
+        // Tabela cheia: a capacidade (e com ela o endpoint) e descartada aqui.
+        Err(_) => ERRO,
     }
-    let (nome, tamanho) = match arquivos::info(indice as usize) {
-        Some(i) => i,
-        None => return ERRO,
-    };
-    let mut saida = [0u8; 48];
-    saida[..8].copy_from_slice(&tamanho.to_le_bytes());
-    let n = nome.len().min(arquivos::TAMANHO_NOME);
-    saida[8..8 + n].copy_from_slice(&nome.as_bytes()[..n]);
-    unsafe { core::ptr::copy_nonoverlapping(saida.as_ptr(), ptr as *mut u8, 48) };
-    0
 }
 
-/// Pedido de leitura, na memoria do usuario: cinco u64 seguidos
-/// (nome_ptr, nome_len, deslocamento, buf_ptr, buf_len).
-fn sys_ler_arquivo(ptr_pedido: u64) -> u64 {
-    let usuario = match escalonador::usuario_atual() {
-        Some(u) => u,
-        None => return ERRO,
-    };
-    if !usuario.regiao_valida(ptr_pedido, 40) {
-        return ERRO;
+/// Le a mensagem da memoria do usuario (copia como bytes: o ponteiro pode estar desalinhado).
+fn ler_mensagem_usuario(
+    usuario: &crate::processo::Usuario,
+    ptr: u64,
+) -> Option<[u64; PALAVRAS_MENSAGEM]> {
+    if !usuario.regiao_valida(ptr, TAM_MENSAGEM) {
+        return None;
     }
-    // Copia como bytes: o ponteiro do usuario pode estar desalinhado.
-    let mut cru = [0u8; 40];
-    unsafe { core::ptr::copy_nonoverlapping(ptr_pedido as *const u8, cru.as_mut_ptr(), 40) };
-    let mut campos = [0u64; 5];
+    let mut cru = [0u8; PALAVRAS_MENSAGEM * 8];
+    unsafe { core::ptr::copy_nonoverlapping(ptr as *const u8, cru.as_mut_ptr(), cru.len()) };
+    let mut campos = [0u64; PALAVRAS_MENSAGEM];
     for (i, c) in campos.iter_mut().enumerate() {
         let mut b = [0u8; 8];
         b.copy_from_slice(&cru[i * 8..i * 8 + 8]);
         *c = u64::from_le_bytes(b);
     }
-    let [nome_ptr, nome_len, deslocamento, buf_ptr, buf_len] = campos;
+    Some(campos)
+}
 
-    let nome = match nome_do_usuario(&usuario, nome_ptr, nome_len) {
+/// Espera um pouco por uma mudanca no endpoint: primeiro entrega a CPU a outro processo
+/// (a resposta costuma estar a um passo de distancia), depois dorme ate a proxima
+/// interrupcao, para nao gastar CPU a toa quando todo mundo esta esperando.
+fn esperar_ipc(tentativa: &mut u32) {
+    if *tentativa % 2 == 0 {
+        escalonador::ceder();
+    } else {
+        esperar_evento();
+    }
+    *tentativa = tentativa.wrapping_add(1);
+}
+
+/// Envia uma mensagem (e, se pedido, uma capacidade com direitos reduzidos).
+/// Com `bloquear`, espera se a fila estiver cheia; sem, devolve ERRO_CHEIA (um servidor
+/// que responde a clientes nao pode ficar preso por causa de um cliente que nao le).
+/// Falha com ERRO_PAR_MORTO se ninguem mais pode receber.
+fn sys_enviar(handle: u64, ptr: u64, bloquear: bool) -> u64 {
+    let usuario = match escalonador::usuario_atual() {
+        Some(u) => u,
+        None => return ERRO,
+    };
+    let campos = match ler_mensagem_usuario(&usuario, ptr) {
+        Some(c) => c,
+        None => return ERRO,
+    };
+    let (rotulo, cap_handle, cap_mascara) = (campos[0], campos[1], campos[2]);
+    let mut dados = [0u64; PALAVRAS_DADOS];
+    dados.copy_from_slice(&campos[CABECALHO_MENSAGEM..]);
+
+    // Resolve de uma vez o endpoint e a capacidade que vai junto. Para passar uma
+    // capacidade adiante, o processo precisa ter o direito COPIAR sobre ela.
+    let resolvido = escalonador::com_caps_atual(|t| {
+        let via = t.obter(handle)?.via()?;
+        let cap = if cap_handle == SEM_CAP {
+            None
+        } else {
+            Some(t.obter(cap_handle)?.derivar(cap_mascara as u32)?)
+        };
+        Some((via, cap))
+    });
+    let (via, cap) = match resolvido {
+        Some(r) => r,
+        None => return ERRO,
+    };
+
+    let mut msg = Mensagem { rotulo, dados, cap };
+    let mut tentativa = 0u32;
+    loop {
+        match via.enviar(msg) {
+            Ok(()) => return 0,
+            Err((ErroEnvio::Cheia, volta)) => {
+                if !bloquear {
+                    return ERRO_CHEIA;
+                }
+                msg = volta;
+                esperar_ipc(&mut tentativa);
+            }
+            Err((ErroEnvio::ParMorto, _)) => return ERRO_PAR_MORTO,
+            Err((ErroEnvio::Direito, _)) => return ERRO,
+        }
+    }
+}
+
+/// Recebe a proxima mensagem. Espera ate chegar uma; falha com ERRO_PAR_MORTO se a fila
+/// esta vazia e ninguem mais pode enviar. Se vier uma capacidade, ela entra na tabela e o
+/// handle novo aparece no campo `cap` (ou o flag "cap perdida" se a tabela estiver cheia).
+fn sys_receber(handle: u64, ptr: u64) -> u64 {
+    let usuario = match escalonador::usuario_atual() {
+        Some(u) => u,
+        None => return ERRO,
+    };
+    if !usuario.regiao_gravavel(ptr, TAM_MENSAGEM) {
+        return ERRO;
+    }
+    let via = match escalonador::com_caps_atual(|t| t.obter(handle).and_then(|c| c.via())) {
+        Some(v) => v,
+        None => return ERRO,
+    };
+    let mut tentativa = 0u32;
+    let msg = loop {
+        match via.receber() {
+            Ok(m) => break m,
+            Err(ErroRecepcao::Vazia) => esperar_ipc(&mut tentativa),
+            Err(ErroRecepcao::ParMorto) => return ERRO_PAR_MORTO,
+            Err(ErroRecepcao::Direito) => return ERRO,
+        }
+    };
+
+    let mut saida = [0u64; PALAVRAS_MENSAGEM];
+    saida[0] = msg.rotulo;
+    saida[1] = SEM_CAP;
+    saida[CABECALHO_MENSAGEM..].copy_from_slice(&msg.dados);
+    if let Some(cap) = msg.cap {
+        let direitos = cap.direitos() as u64;
+        match escalonador::com_caps_atual(|t| t.inserir(cap)) {
+            Ok(h) => {
+                saida[1] = h as u64;
+                saida[2] = direitos;
+            }
+            // Tabela cheia: a capacidade e descartada e o usuario e avisado.
+            Err(_) => saida[3] = 1,
+        }
+    }
+
+    let mut cru = [0u8; PALAVRAS_MENSAGEM * 8];
+    for (i, c) in saida.iter().enumerate() {
+        cru[i * 8..i * 8 + 8].copy_from_slice(&c.to_le_bytes());
+    }
+    unsafe { core::ptr::copy_nonoverlapping(cru.as_ptr(), ptr as *mut u8, cru.len()) };
+    0
+}
+
+fn sys_cap_fechar(handle: u64) -> u64 {
+    // A capacidade sai da tabela dentro da trava e e descartada aqui fora.
+    match escalonador::com_caps_atual(|t| t.remover(handle)) {
+        Some(_cap) => 0,
+        None => ERRO,
+    }
+}
+
+fn sys_cap_reduzir(handle: u64, mascara: u64) -> u64 {
+    if escalonador::com_caps_atual(|t| t.reduzir(handle, (mascara & 0x7) as u32)) {
+        0
+    } else {
+        ERRO
+    }
+}
+
+/// Como `executar`, mas o processo novo ja nasce com uma capacidade (no handle 0):
+/// uma copia, com direitos reduzidos pela mascara, da capacidade `handle` do pai.
+fn sys_executar_com(ptr: u64, len: u64, empacotado: u64) -> u64 {
+    let usuario = match escalonador::usuario_atual() {
+        Some(u) => u,
+        None => return ERRO,
+    };
+    let nome = match nome_do_usuario(&usuario, ptr, len) {
         Some(n) => n,
         None => return ERRO,
     };
-    if buf_len == 0 || buf_len > 4096 || !usuario.regiao_gravavel(buf_ptr, buf_len) {
+    let handle = empacotado & 0xff;
+    let mascara = ((empacotado >> 8) & 0x7) as u32;
+    let cap = match escalonador::com_caps_atual(|t| t.obter(handle).and_then(|c| c.derivar(mascara)))
+    {
+        Some(c) => c,
+        None => return ERRO,
+    };
+    // As interrupcoes ficam desligadas ate o fim da syscall: o filho so comeca a rodar
+    // depois de receber a capacidade.
+    match crate::executar_programa(&nome) {
+        Some(id) => {
+            if escalonador::dar_capacidade(id, cap) {
+                id as u64
+            } else {
+                ERRO
+            }
+        }
+        None => ERRO,
+    }
+}
+
+// ---------------------------------------------------------------- disco como capacidade
+
+/// O processo tem uma capacidade DE DISCO, com o direito de ler, nesse handle?
+fn pode_ler_disco(handle: u64) -> bool {
+    escalonador::com_caps_atual(|t| {
+        t.obter(handle).map_or(false, |c| c.eh_disco() && c.direitos() & DIREITO_LER != 0)
+    })
+}
+
+/// Le de 1 a 8 setores para a memoria do usuario. `empacotado` = handle | n_setores << 8.
+fn sys_disco_ler(empacotado: u64, setor: u64, ptr: u64) -> u64 {
+    let handle = empacotado & 0xff;
+    let n = (empacotado >> 8) & 0xff;
+    if n == 0 || n > 8 || !pode_ler_disco(handle) {
+        return ERRO;
+    }
+    let usuario = match escalonador::usuario_atual() {
+        Some(u) => u,
+        None => return ERRO,
+    };
+    let bytes = (n as usize) * crate::disco::TAMANHO_SETOR;
+    if !usuario.regiao_gravavel(ptr, bytes as u64) {
         return ERRO;
     }
     // Le para um buffer do kernel e so depois copia: o disco nunca escreve direto no usuario.
-    let mut temp = [0u8; 4096];
-    match arquivos::ler(&nome, deslocamento, &mut temp[..buf_len as usize]) {
-        Ok(n) => {
-            unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr as *mut u8, n) };
-            n as u64
+    let mut temp = [0u8; 8 * crate::disco::TAMANHO_SETOR];
+    match crate::disco::ler(setor, n as usize, &mut temp[..bytes]) {
+        Ok(()) => {
+            unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), ptr as *mut u8, bytes) };
+            0
         }
         Err(_) => ERRO,
     }
+}
+
+/// Tamanho do disco em setores.
+fn sys_disco_info(handle: u64) -> u64 {
+    if !pode_ler_disco(handle) {
+        return ERRO;
+    }
+    crate::disco::capacidade().unwrap_or(ERRO)
 }

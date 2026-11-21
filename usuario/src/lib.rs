@@ -1,5 +1,7 @@
 #![no_std]
 
+pub mod fs;
+
 extern crate alloc;
 
 use core::alloc::{GlobalAlloc, Layout};
@@ -20,10 +22,21 @@ pub const SYS_ESPERAR: u64 = 8;
 pub const SYS_TAREFAS: u64 = 9;
 pub const SYS_MEMINFO: u64 = 10;
 pub const SYS_LIMPAR: u64 = 11;
-pub const SYS_INFO_ARQUIVO: u64 = 12;
-pub const SYS_LER_ARQUIVO: u64 = 13;
+pub const SYS_EP_CRIAR: u64 = 14;
+pub const SYS_ENVIAR: u64 = 15;
+pub const SYS_RECEBER: u64 = 16;
+pub const SYS_CAP_FECHAR: u64 = 17;
+pub const SYS_CAP_REDUZIR: u64 = 18;
+pub const SYS_EXECUTAR_COM: u64 = 19;
+pub const SYS_TENTAR_ENVIAR: u64 = 22;
+pub const SYS_DISCO_LER: u64 = 20;
+pub const SYS_DISCO_INFO: u64 = 21;
 /// Valor devolvido pelo kernel quando uma syscall falha.
 pub const ERRO: u64 = u64::MAX;
+/// O outro lado de um endpoint nao existe mais.
+pub const ERRO_PAR_MORTO: u64 = u64::MAX - 1;
+/// A fila do endpoint esta cheia (so em `tentar_enviar`).
+pub const ERRO_CHEIA: u64 = u64::MAX - 2;
 
 /// Chama o kernel. Convencao: rax = numero; rdi, rsi, rdx = argumentos; resultado em rax.
 /// O kernel zera rdi/rsi/rdx/r8-r10 na volta (para nao vazar valores internos),
@@ -114,43 +127,166 @@ pub fn limpar_tela() {
     syscall(SYS_LIMPAR, 0, 0, 0);
 }
 
-/// Informacoes de um arquivo do disco (mesmo formato que o kernel preenche).
+// ---- IPC e capacidades ----
+// Uma capacidade e um numero (handle) que o kernel entende como "este endpoint, com estes
+// direitos". Sem a capacidade na sua tabela, o processo nao tem como falar com o endpoint.
+
+pub const DIREITO_ENVIAR: u64 = 1;
+pub const DIREITO_RECEBER: u64 = 2;
+/// Pode ser passada adiante (numa mensagem ou a um processo filho).
+pub const DIREITO_COPIAR: u64 = 4;
+/// Ler setores do disco (so existe na capacidade do disco).
+pub const DIREITO_LER: u64 = 8;
+pub const DIREITOS_TODOS: u64 = DIREITO_ENVIAR | DIREITO_RECEBER | DIREITO_COPIAR | DIREITO_LER;
+/// Valor de `Mensagem::cap` quando nao ha capacidade.
+pub const SEM_CAP: u64 = u64::MAX;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErroIpc {
+    /// Handle inexistente, direito que falta, ponteiro invalido ou tabela cheia.
+    Invalido,
+    /// Todos os que poderiam estar do outro lado morreram.
+    ParMorto,
+    /// A fila esta cheia (so em `tentar_enviar`, que nao espera).
+    Cheia,
+}
+
+/// Palavras (u64) de dados de uma mensagem: 256 bytes.
+pub const PALAVRAS_DADOS: usize = 32;
+
+/// Mensagem de tamanho fixo (288 bytes). O formato e o mesmo que o kernel le e escreve.
 #[repr(C)]
-pub struct InfoArquivo {
-    pub tamanho: u64,
-    nome: [u8; 40],
+#[derive(Debug, Clone, Copy)]
+pub struct Mensagem {
+    pub rotulo: u64,
+    /// Ao enviar: handle (meu) da capacidade a passar, ou SEM_CAP.
+    /// Ao receber: handle (novo, na minha tabela) da capacidade que chegou, ou SEM_CAP.
+    pub cap: u64,
+    /// Ao enviar: direitos que a copia vai ter. Ao receber: direitos da capacidade recebida.
+    pub cap_direitos: u64,
+    /// Ao receber: 1 se uma capacidade veio mas a minha tabela estava cheia (ela se perdeu).
+    pub cap_perdida: u64,
+    pub dados: [u64; PALAVRAS_DADOS],
 }
 
-impl InfoArquivo {
-    pub fn nome(&self) -> &str {
-        let fim = self.nome.iter().position(|&b| b == 0).unwrap_or(self.nome.len());
-        core::str::from_utf8(&self.nome[..fim]).unwrap_or("?")
+impl Mensagem {
+    pub const fn vazia() -> Mensagem {
+        Mensagem {
+            rotulo: 0,
+            cap: SEM_CAP,
+            cap_direitos: 0,
+            cap_perdida: 0,
+            dados: [0; PALAVRAS_DADOS],
+        }
+    }
+
+    /// Mensagem com as quatro primeiras palavras de dados preenchidas.
+    pub const fn nova(rotulo: u64, dados: [u64; 4]) -> Mensagem {
+        let mut m = Mensagem::vazia();
+        m.rotulo = rotulo;
+        m.dados[0] = dados[0];
+        m.dados[1] = dados[1];
+        m.dados[2] = dados[2];
+        m.dados[3] = dados[3];
+        m
+    }
+
+    /// Anexa a capacidade `handle`, que chegara ao outro lado so com os `direitos` dados.
+    /// (Quem envia precisa ter o direito COPIAR sobre ela.)
+    pub const fn com_cap(mut self, handle: u64, direitos: u64) -> Mensagem {
+        self.cap = handle;
+        self.cap_direitos = direitos;
+        self
+    }
+
+    /// Os 256 bytes de dados, como bytes (para nomes e blocos de arquivo).
+    pub fn bytes(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.dados.as_ptr() as *const u8, PALAVRAS_DADOS * 8) }
+    }
+
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            core::slice::from_raw_parts_mut(self.dados.as_mut_ptr() as *mut u8, PALAVRAS_DADOS * 8)
+        }
     }
 }
 
-/// Informacoes do arquivo de numero `indice` (None quando os arquivos acabam).
-pub fn info_arquivo(indice: u64) -> Option<InfoArquivo> {
-    let mut info = InfoArquivo { tamanho: 0, nome: [0; 40] };
-    match syscall(SYS_INFO_ARQUIVO, indice, &mut info as *mut InfoArquivo as u64, 0) {
+fn resultado_ipc(r: u64) -> Result<(), ErroIpc> {
+    match r {
+        0 => Ok(()),
+        ERRO_PAR_MORTO => Err(ErroIpc::ParMorto),
+        ERRO_CHEIA => Err(ErroIpc::Cheia),
+        _ => Err(ErroIpc::Invalido),
+    }
+}
+
+/// Cria um endpoint novo. Devolve o handle, com todos os direitos.
+pub fn criar_endpoint() -> Option<u64> {
+    match syscall(SYS_EP_CRIAR, 0, 0, 0) {
         ERRO => None,
-        _ => Some(info),
+        h => Some(h),
     }
 }
 
-/// Le ate `buf.len()` bytes (no maximo 4096) de um arquivo do disco, a partir de `deslocamento`.
-/// Devolve quantos bytes vieram (0 = fim do arquivo) ou None se o arquivo nao existe.
-pub fn ler_arquivo(nome: &str, deslocamento: u64, buf: &mut [u8]) -> Option<usize> {
-    let pedido: [u64; 5] = [
-        nome.as_ptr() as u64,
-        nome.len() as u64,
-        deslocamento,
-        buf.as_mut_ptr() as u64,
-        buf.len() as u64,
-    ];
-    match syscall(SYS_LER_ARQUIVO, pedido.as_ptr() as u64, 0, 0) {
+/// Envia uma mensagem. Espera se a fila do endpoint estiver cheia.
+pub fn enviar(handle: u64, msg: &Mensagem) -> Result<(), ErroIpc> {
+    resultado_ipc(syscall(SYS_ENVIAR, handle, msg as *const Mensagem as u64, 0))
+}
+
+/// Como `enviar`, mas nao espera: se a fila estiver cheia, devolve `ErroIpc::Cheia`.
+/// E o que um servidor deve usar para responder (um cliente que nao le nao pode prende-lo).
+pub fn tentar_enviar(handle: u64, msg: &Mensagem) -> Result<(), ErroIpc> {
+    resultado_ipc(syscall(SYS_TENTAR_ENVIAR, handle, msg as *const Mensagem as u64, 0))
+}
+
+/// Espera chegar uma mensagem e a coloca em `msg`.
+pub fn receber(handle: u64, msg: &mut Mensagem) -> Result<(), ErroIpc> {
+    resultado_ipc(syscall(SYS_RECEBER, handle, msg as *mut Mensagem as u64, 0))
+}
+
+/// Fecha uma capacidade (o handle deixa de valer).
+pub fn fechar_cap(handle: u64) -> bool {
+    syscall(SYS_CAP_FECHAR, handle, 0, 0) == 0
+}
+
+/// Abre mao de direitos de uma capacidade (so fica com os que estao na mascara).
+/// Tambem serve para testar se um handle existe: `reduzir_cap(h, DIREITOS_TODOS)` nao muda nada.
+pub fn reduzir_cap(handle: u64, mascara: u64) -> bool {
+    syscall(SYS_CAP_REDUZIR, handle, mascara, 0) == 0
+}
+
+/// Como `executar`, mas o processo novo nasce com uma copia da capacidade `handle`
+/// (limitada pelos `direitos`) no handle 0 dele.
+pub fn executar_com(nome: &str, handle: u64, direitos: u64) -> Option<u64> {
+    let empacotado = (handle & 0xff) | (direitos << 8);
+    match syscall(SYS_EXECUTAR_COM, nome.as_ptr() as u64, nome.len() as u64, empacotado) {
         ERRO => None,
-        n => Some(n as usize),
+        id => Some(id),
     }
+}
+
+// ---- Disco como capacidade ----
+// So quem recebe a capacidade do disco (hoje, o servidor de arquivos) consegue ler setores.
+
+pub const TAMANHO_SETOR: usize = 512;
+
+/// Tamanho do disco em setores, usando a capacidade do disco no handle dado.
+pub fn disco_setores(handle: u64) -> Option<u64> {
+    match syscall(SYS_DISCO_INFO, handle, 0, 0) {
+        ERRO => None,
+        n => Some(n),
+    }
+}
+
+/// Le setores a partir de `setor` para `destino`, que deve ter de 1 a 8 setores inteiros
+/// (multiplo de 512 bytes). Falha sem a capacidade do disco ou se passar do fim do disco.
+pub fn disco_ler(handle: u64, setor: u64, destino: &mut [u8]) -> bool {
+    let n = destino.len() / TAMANHO_SETOR;
+    if n == 0 || n > 8 || destino.len() % TAMANHO_SETOR != 0 {
+        return false;
+    }
+    let empacotado = (handle & 0xff) | ((n as u64) << 8);
+    syscall(SYS_DISCO_LER, empacotado, setor, destino.as_mut_ptr() as u64) == 0
 }
 
 // ---- Alocador de memoria do programa ----
